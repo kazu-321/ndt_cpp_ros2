@@ -15,10 +15,13 @@
 #include <cstddef>
 #include <iostream>
 #include <fstream>
+#include <rclcpp/logging.hpp>
+#include <tf2/LinearMath/Quaternion.hpp>
 #include <vector>
 #include <sstream>
 #include <cmath>
 #include <chrono>
+#include "geometry_msgs/msg/transform_stamped.hpp"
 #include "ndt_cpp_ros2/flatkdtree.h"
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
@@ -28,7 +31,10 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
-
+#include "tf2_ros/transform_broadcaster.h"
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2/utils.h>
 
 struct point2{
     float x, y;
@@ -436,15 +442,42 @@ class ndt_cpp_ros2 : public rclcpp::Node
 public:
     ndt_cpp_ros2():Node("ndt_cpp_ros2")
     {
+				// パラメータの宣言
+				// tfのフレーム名
+				this->declare_parameter("map_frame_id", "map");	
+				this->declare_parameter("odom_frame_id", "odom");
+				this->declare_parameter("base_frame_id", "base_link");
+				this->declare_parameter("laser_frame_id", "laser");
+
+				// mapからodomへの初期位置
+				this->declare_parameter("initial_pose_x", 0.0);
+				this->declare_parameter("initial_pose_y", 0.0);
+				this->declare_parameter("initial_pose_yaw", 0.0);
+
+				// LiDARが逆さまならtrue
+				this->declare_parameter("reverse_scan", false);
+
+				// 処理周期
+				this->declare_parameter("frequency_millisec", 100);
+				
+				// tfのbroadcaster, listener, buffer
+				tfBroadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+				tfBuffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+				tfListener_ = std::make_shared<tf2_ros::TransformListener>(*tfBuffer_);
+
         scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-            "/scan", rclcpp::SensorDataQoS(), std::bind(&ndt_cpp_ros2::scan_callback, this, std::placeholders::_1));
+            "scan", rclcpp::SensorDataQoS(), std::bind(&ndt_cpp_ros2::scan_callback, this, std::placeholders::_1));
         map_sub_ =this->create_subscription<nav_msgs::msg::OccupancyGrid>(
-            "/map", 10, std::bind(&ndt_cpp_ros2::map_callback, this, std::placeholders::_1));
+            "map", 10, std::bind(&ndt_cpp_ros2::map_callback, this, std::placeholders::_1));
         pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("output/pose", 10);
-        timer_ = this->create_wall_timer(std::chrono::milliseconds(100), std::bind(&ndt_cpp_ros2::timer_callback, this));
+        timer_ = this->create_wall_timer(std::chrono::milliseconds(this->get_parameter("frequency").as_int()), std::bind(&ndt_cpp_ros2::timer_callback, this));
+
         old_point.x = 0.0;
         old_point.y = 0.0;
         old_point.z = 0.0;
+				is_first = true;
+
+				RCLCPP_INFO(this->get_logger(),"[param]reverse_scan: %b",this->get_parameter("reverse_scan").as_bool());
     }
 
 private:
@@ -452,43 +485,127 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
+		std::unique_ptr<tf2_ros::Buffer> tfBuffer_;
+		std::shared_ptr<tf2_ros::TransformListener> tfListener_;
+		std::unique_ptr<tf2_ros::TransformBroadcaster> tfBroadcaster_;
     std::vector<point2> transformed_scan_points;
     rclcpp::TimerBase::SharedPtr timer_;
+		bool is_first;
 
     void timer_callback()
     {       
         if(map_points.empty() || transformed_scan_points.empty()){
+					RCLCPP_INFO(this->get_logger(),"No map data or scan data received yet");
             return;
         }
-        auto trans_mat1 = makeTransformationMatrix(old_point.x, old_point.y, old_point.z);
+
+				std::string mapFrameRel = this->get_parameter("map_frame_id").as_string();
+				std::string odomFrameRel = this->get_parameter("odom_frame_id").as_string();
+				std::string baseFrameRel = this->get_parameter("base_frame_id").as_string();
+				std::string laserFrameRel = this->get_parameter("laser_frame_id").as_string();
+
+				geometry_msgs::msg::TransformStamped mapToLaser;
+
+				if(is_first){
+					geometry_msgs::msg::TransformStamped transformStamped;
+					transformStamped.header.stamp = this->now();
+					transformStamped.header.frame_id = "map";
+					transformStamped.child_frame_id = "odom";
+					transformStamped.transform.translation.x = this->get_parameter("initial_pose_x").as_double();
+					transformStamped.transform.translation.y = this->get_parameter("initial_pose_y").as_double();
+					transformStamped.transform.translation.z = 0.0;
+					tf2::Quaternion q;
+					q.setRPY(0, 0, this->get_parameter("initial_pose_yaw").as_double());
+					transformStamped.transform.rotation = tf2::toMsg(q);
+
+					tfBroadcaster_->sendTransform(transformStamped);
+					try {
+						mapToLaser = tfBuffer_->lookupTransform(
+							mapFrameRel, laserFrameRel,
+							tf2::TimePointZero);
+					} catch (const tf2::TransformException & ex) {
+						RCLCPP_INFO(
+							this->get_logger(), "Could not transform %s to %s: %s",
+							mapFrameRel.c_str(), laserFrameRel.c_str(), ex.what());
+						return;
+					}
+					is_first = false;
+				}
+				else{
+					try {
+						mapToLaser = tfBuffer_->lookupTransform(
+							mapFrameRel, laserFrameRel,
+							tf2::TimePointZero);
+					} catch (const tf2::TransformException & ex) {
+						RCLCPP_INFO(
+							this->get_logger(), "Could not transform %s to %s: %s",
+							mapFrameRel.c_str(), laserFrameRel.c_str(), ex.what());
+						return;
+					}
+				}
+        auto trans_mat1 = makeTransformationMatrix(mapToLaser.transform.translation.x, mapToLaser.transform.translation.y, mapToLaser.transform.rotation.z);
         auto ndt_points = std::vector<ndtpoint2>();
 
         compute_ndt_points(map_points, ndt_points);
         ndt_scan_matching(trans_mat1, transformed_scan_points, ndt_points);
+
         float x=trans_mat1.c;
         float y=trans_mat1.f;
         float theta=std::atan(trans_mat1.d/trans_mat1.a);
-        geometry_msgs::msg::PoseStamped pose;
-        pose.header.stamp = this->now();
-        pose.header.frame_id = "map";   
-        pose.pose.position.x=x;
-        pose.pose.position.y=y;
-        pose.pose.position.z=0.0;
-        
-        tf2::Quaternion q;
-        q.setRPY(0, 0, theta);
-        pose.pose.orientation.x = q.x();
-        pose.pose.orientation.y = q.y();
-        pose.pose.orientation.z = q.z();
-        pose.pose.orientation.w = q.w();
-        pose_pub_->publish(pose);
         RCLCPP_INFO(this->get_logger(),"x:%f, y:%f, theta:%f",x,y,theta);
-        writePointsToSVG(transformed_scan_points, map_points, "scan_points.svg");
-        if(-1.0<=x&&x<=3.5&&-1.0<=y&&y<=4.5){
-            old_point.x=x;
-            old_point.y=y;
-            old_point.z=theta;
-        }
+
+				geometry_msgs::msg::TransformStamped resultTransform;
+				resultTransform.transform.translation.x = x;
+				resultTransform.transform.translation.y = y;
+				tf2::Quaternion q;
+				q.setRPY(0.0,0.0,theta);
+				resultTransform.transform.rotation = tf2::toMsg(q);
+
+				// odom->base_linkの変換を取得
+				geometry_msgs::msg::TransformStamped odomToLaser;
+				try {
+					odomToLaser = tfBuffer_->lookupTransform(
+						odomFrameRel, laserFrameRel,
+						tf2::TimePointZero);
+				} catch (const tf2::TransformException & ex) {
+					RCLCPP_INFO(
+						this->get_logger(), "Could not transform %s to %s: %s",
+						odomFrameRel.c_str(), laserFrameRel.c_str(), ex.what());
+					return;
+				}
+
+				tf2::Transform odomToLaserTF2,resultTF2;
+				tf2::fromMsg(odomToLaser.transform, odomToLaserTF2);	
+				tf2::fromMsg(resultTransform.transform, resultTF2);	
+
+				// LiDARが逆さまの時の対応。yawのみを取得してodom->base_linkの変換の回転を作成
+				float yaw = tf2::getYaw(odomToLaserTF2.getRotation());
+				tf2::Quaternion odomToLaserTF2Rot;
+				odomToLaserTF2Rot.setRPY(0.0, 0.0, yaw);
+				odomToLaserTF2.setRotation(odomToLaserTF2Rot);
+
+				resultTF2 = resultTF2 * odomToLaserTF2.inverse();
+
+				geometry_msgs::msg::TransformStamped transformStamped;
+				transformStamped.header.stamp = this->now();
+				transformStamped.header.frame_id = "map";
+				transformStamped.child_frame_id = "odom";
+				transformStamped.transform = tf2::toMsg(resultTF2);
+
+				tfBroadcaster_->sendTransform(transformStamped);
+
+				geometry_msgs::msg::PoseStamped pose;
+				pose.header.stamp = this->now();
+				pose.header.frame_id = "map";
+				pose.pose.position.x = x;
+				pose.pose.position.y = y;
+				pose.pose.position.z = 0.0;
+				pose.pose.orientation.x = 0.0;
+				pose.pose.orientation.y = 0.0;
+				pose.pose.orientation.z = sin(theta/2);
+				pose.pose.orientation.w = cos(theta/2);
+				pose_pub_->publish(pose);
+
     }
 
     void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
@@ -501,11 +618,22 @@ private:
                 continue;
             }
             point2 point;
-            point.x = msg->ranges[i] * cosf(msg->angle_min + msg->angle_increment * i - M_PI/2)-0.5;
-            point.y = msg->ranges[i] * sinf(msg->angle_min + msg->angle_increment * i - M_PI/2)-0.0;
+						if(this->get_parameter("reverse_scan").as_bool()){
+							double angle = msg->angle_max - msg->angle_increment * i;
+
+							if(abs(angle)>1.569){
+								continue;
+							}
+
+							point.x = msg->ranges[i] * cosf(angle);
+							point.y = msg->ranges[i] * sinf(angle);
+
+						}else{
+							point.x = msg->ranges[i] * cosf(msg->angle_min + msg->angle_increment * i - M_PI/2);
+							point.y = msg->ranges[i] * sinf(msg->angle_min + msg->angle_increment * i - M_PI/2);
+						}
             transformed_scan_points.push_back(point);    
         }
-
     }
 
     void map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
@@ -521,31 +649,9 @@ private:
                 map_points.push_back(point);
             }
         }
+
     }
 
-    // int main(void){
-    //     std::vector<point2> scan_points1;
-    //     std::vector<point2> target_points;
-    //     readScanPoints("./data/scan_1.txt", scan_points1);
-    //     readScanPoints("./data/scan_2.txt", target_points);
-
-    //     auto trans_mat1 = makeTransformationMatrix(1.0f, 0.0f, 0.5f);
-    //     transformPointsZeroCopy(trans_mat1, scan_points1);
-
-    //     auto ndt_points = std::vector<ndtpoint2>();
-    //     auto start_time = std::chrono::high_resolution_clock::now();
-
-    //     compute_ndt_points(target_points, ndt_points);
-    //     ndt_scan_matching(trans_mat1, scan_points1, ndt_points);
-
-    //     auto end_time = std::chrono::high_resolution_clock::now();
-
-    //     transformPointsZeroCopy(trans_mat1, scan_points1);
-
-    //     //debug
-    //     auto microsec = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count() / 1e6;
-    //     std::cout << (microsec) << " mill sec" << std::endl;
-    // }
     double get_yaw(const geometry_msgs::msg::Quaternion &q){return atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));}
     point3 old_point;
 

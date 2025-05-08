@@ -25,11 +25,22 @@ ros2 run ndt_cpp_ros2 ndt_cpp_ros2
 
 ### Output
 - `/output/pose`: geometry_msgs::msg::PoseStamped
-- `/tf`:
+- `/tf`: map -> odom
 
-<!-- ## Parameters
-- `map_frame_id`: map frame id
-- `base_frame_id`: base frame id -->
+## Supposed TF
+odom -> base_link -> laser_link
+
+## Parameters
+- `map_frame_id` : map frame id in tf. default: map
+- `odom_frame_id` : odom frame id in tf. default: odom
+- `base_frame_id` : base frame id in tf. default: base_link
+- `laser_frame_id` : laser frame id in tf. default: laser_link
+
+- `initial_pose_x` : initial pose x. default: 0.0
+- `initial_pose_y` : initial pose y. default: 0.0
+- `initial_pose_yaw` : initial pose yaw. default: 0.0
+
+- `frequency_millisec` : frequency. default: 100
 
 ## LICENSE
 
